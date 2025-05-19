@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import traceback
+import types
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -78,6 +80,28 @@ class LangFuseTracer(BaseTracer):
 
         return True
 
+    def _convert_value_to_safe_type(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(k): self._convert_value_to_safe_type(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._convert_value_to_safe_type(item) for item in value]
+        if isinstance(value, types.GeneratorType):
+            # If a generator is passed directly, convert its representation to a string.
+            # The component itself (e.g., ChatOutput) should be responsible for
+            # consuming the generator and providing the materialized content for tracing.
+            logger.warning(
+                f"LangfuseTracer: Encountered a raw generator object: {value}. "
+                f"Converting to string representation. For full content tracing, "
+                f"the component should materialize the generator's output before tracing."
+            )
+            return str(value)
+        return value
+
+    def _convert_dict_to_safe_types(self, data: dict[str, Any] | None) -> dict[str, Any] | None:
+        if data is None:
+            return None
+        return {str(k): self._convert_value_to_safe_type(v) for k, v in data.items()}
+
     @override
     def add_trace(
         self,
@@ -92,15 +116,21 @@ class LangFuseTracer(BaseTracer):
         if not self._ready:
             return
 
-        metadata_: dict = {"from_langflow_component": True, "component_id": trace_id}
-        metadata_ |= {"trace_type": trace_type} if trace_type else {}
-        metadata_ |= metadata or {}
+        processed_inputs = self._convert_dict_to_safe_types(inputs)
+
+        final_metadata: dict[str, Any] = {"from_langflow_component": True, "component_id": trace_id}
+        if trace_type:
+            final_metadata["trace_type"] = trace_type
+        if metadata:
+            safe_user_metadata = self._convert_dict_to_safe_types(metadata)
+            if safe_user_metadata:
+                final_metadata.update(safe_user_metadata)
 
         name = trace_name.removesuffix(f" ({trace_id})")
         content_span = {
             "name": name,
-            "input": inputs,
-            "metadata": metadata_,
+            "input": processed_inputs,
+            "metadata": final_metadata,
             "start_time": start_time,
         }
 
@@ -128,12 +158,38 @@ class LangFuseTracer(BaseTracer):
 
         span = self.spans.pop(trace_id, None)
         if span:
-            output: dict = {}
-            output |= outputs or {}
-            output |= {"error": str(error)} if error else {}
-            output |= {"logs": list(logs)} if logs else {}
-            content = serialize({"output": output, "end_time": end_time})
-            span.update(**content)
+            processed_outputs = self._convert_dict_to_safe_types(outputs)
+
+            safe_logs = []
+            if logs:
+                for log_entry in logs:
+                    if isinstance(log_entry, dict):
+                        safe_logs.append(self._convert_dict_to_safe_types(log_entry))
+                    else:  # Log object
+                        # Assuming Log object is inherently serializable or has a method like model_dump()
+                        safe_logs.append(log_entry)
+
+            # This dictionary becomes the value for the "output" key in the span update payload
+            output_field_for_span_update: dict = {}
+            if processed_outputs:
+                output_field_for_span_update.update(processed_outputs)
+
+            if error:  # Include error string in the "output" field as per original logic
+                output_field_for_span_update["error"] = str(error)
+
+            if safe_logs:
+                output_field_for_span_update["logs"] = list(safe_logs)
+
+            content_for_update: dict[str, Any] = {"end_time": end_time}
+            if output_field_for_span_update:  # Only add "output" key if there's content for it
+                content_for_update["output"] = output_field_for_span_update
+
+            if error:  # Also set span-level error indicators
+                content_for_update["level"] = "ERROR"
+                string_stacktrace = traceback.format_exception(error)
+                error_message = f"{error.__class__.__name__}: {error}\n\n{''.join(string_stacktrace)}"
+                content_for_update["status_message"] = error_message
+            span.update(**serialize(content_for_update))
 
     @override
     def end(
@@ -145,12 +201,28 @@ class LangFuseTracer(BaseTracer):
     ) -> None:
         if not self._ready:
             return
-        content_update = {
-            "input": inputs,
-            "output": outputs,
-            "metadata": metadata,
-        }
-        self.trace.update(**serialize(content_update))
+
+        safe_inputs = self._convert_dict_to_safe_types(inputs)
+        safe_outputs = self._convert_dict_to_safe_types(outputs)
+        safe_metadata = self._convert_dict_to_safe_types(metadata)
+
+        update_payload: dict[str, Any] = {}
+        if safe_inputs is not None:
+            update_payload["input"] = safe_inputs
+        if safe_outputs is not None:
+            update_payload["output"] = safe_outputs
+        if safe_metadata is not None:
+            update_payload["metadata"] = safe_metadata
+
+        serialized_payload = serialize(update_payload)
+
+        if error:
+            serialized_payload["level"] = "ERROR"
+            string_stacktrace = traceback.format_exception(error)
+            error_message = f"{error.__class__.__name__}: {error}\n\n{''.join(string_stacktrace)}"
+            serialized_payload["status_message"] = error_message
+
+        self.trace.update(**serialized_payload)
         self._client.flush()
 
     def get_langchain_callback(self) -> BaseCallbackHandler | None:

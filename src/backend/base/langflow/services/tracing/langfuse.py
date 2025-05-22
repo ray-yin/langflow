@@ -223,7 +223,6 @@ class LangFuseTracer(BaseTracer):
             serialized_payload["status_message"] = error_message
 
         self.trace.update(**serialized_payload)
-        self._client.flush()
 
     def get_langchain_callback(self) -> BaseCallbackHandler | None:
         if not self._ready:
